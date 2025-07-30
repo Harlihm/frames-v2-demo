@@ -23,10 +23,10 @@ import { Input } from "../components/ui/input";
 import sdk, {
   AddMiniApp,
   ComposeCast,
-  FrameNotificationDetails,
+  MiniAppNotificationDetails,
   SignIn as SignInCore,
   type Context,
-} from "@farcaster/frame-sdk";
+} from "@farcaster/miniapp-sdk";
 import {
   useAccount,
   useSendTransaction,
@@ -37,28 +37,40 @@ import {
   useConnect,
   useSwitchChain,
   useChainId,
+  useWalletClient,
 } from "wagmi";
 
 import { config } from "~/components/providers/WagmiProvider";
 import { Button } from "~/components/ui/Button";
 import { truncateAddress } from "~/lib/truncateAddress";
 import { base, degen, mainnet, monadTestnet, optimism, unichain } from "wagmi/chains";
-import { BaseError, UserRejectedRequestError } from "viem";
+import { BaseError, parseEther, UserRejectedRequestError } from "viem";
 import { createStore } from "mipd";
 import { Label } from "~/components/ui/label";
+
+
+// Handles JSON strinify with `BigInt` values
+function safeJsonStringify(obj: unknown) {
+  return JSON.stringify(obj, (key, value) => {
+    if (typeof value === 'bigint') {
+      return value.toString();
+    }
+    return value;
+  });
+}
 
 export default function Demo(
   { title }: { title?: string } = { title: "Frames v2 Demo" }
 ) {
   const [isSDKLoaded, setIsSDKLoaded] = useState(false);
-  const [context, setContext] = useState<Context.FrameContext>();
+  const [context, setContext] = useState<Context.MiniAppContext>();
   const [token, setToken] = useState<string | null>(null);
   const [isContextOpen, setIsContextOpen] = useState(false);
   const [txHash, setTxHash] = useState<string | null>(null);
 
   const [added, setAdded] = useState(false);
   const [notificationDetails, setNotificationDetails] =
-    useState<FrameNotificationDetails | null>(null);
+    useState<MiniAppNotificationDetails | null>(null);
 
   const [lastEvent, setLastEvent] = useState("");
 
@@ -125,9 +137,9 @@ export default function Demo(
       setContext(context);
       setAdded(context.client.added);
 
-      sdk.on("frameAdded", ({ notificationDetails }) => {
+      sdk.on("miniAppAdded", ({ notificationDetails }) => {
         setLastEvent(
-          `frameAdded${!!notificationDetails ? ", notifications enabled" : ""}`
+          `miniAppAdded${!!notificationDetails ? ", notifications enabled" : ""}`
         );
 
         setAdded(true);
@@ -136,12 +148,12 @@ export default function Demo(
         }
       });
 
-      sdk.on("frameAddRejected", ({ reason }) => {
-        setLastEvent(`frameAddRejected, reason ${reason}`);
+      sdk.on("miniAppAddRejected", ({ reason }) => {
+        setLastEvent(`miniAppAddRejected, reason ${reason}`);
       });
 
-      sdk.on("frameRemoved", () => {
-        setLastEvent("frameRemoved");
+      sdk.on("miniAppRemoved", () => {
+        setLastEvent("miniAppRemoved");
         setAdded(false);
         setNotificationDetails(null);
       });
@@ -329,7 +341,7 @@ export default function Demo(
           {isContextOpen && (
             <div className="p-4 mt-2 bg-gray-100 dark:bg-gray-800 rounded-lg">
               <pre className="font-mono text-xs whitespace-pre-wrap break-words max-w-[260px] overflow-x-">
-                {JSON.stringify(context, null, 2)}
+                {safeJsonStringify(context)}
               </pre>
             </div>
           )}
@@ -381,6 +393,15 @@ export default function Demo(
               </pre>
             </div>
             <ViewProfile />
+          </div>
+
+          <div className="mb-4">
+            <div className="p-2 bg-gray-100 dark:bg-gray-800 rounded-lg my-2">
+              <pre className="font-mono text-xs whitespace-pre-wrap break-words max-w-[260px] overflow-x-">
+                sdk.actions.openMiniApp
+              </pre>
+            </div>
+            <OpenMiniApp />
           </div>
 
           <div className="mb-4">
@@ -520,6 +541,9 @@ export default function Demo(
                   Switch to {nextChain.name}
                 </Button>
                 {isSwitchChainError && renderError(switchChainError)}
+              </div>
+              <div className="mb-4">
+                <TestBatchOperation />
               </div>
             </>
           )}
@@ -1105,6 +1129,166 @@ function SendTokenSolana() {
   );
 }
 
+function TestBatchOperation() {
+  const { address, isConnected } = useAccount();
+  const { data: walletClient } = useWalletClient();
+  const [capabilities, setCapabilities] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [forceAtomic, setForceAtomic] = useState(false);
+  const [isGettingCapabilities, setIsGettingCapabilities] = useState(false);
+  const [isSendingCalls, setIsSendingCalls] = useState(false);
+  const { switchChain } = useSwitchChain();
+
+  const [batchCallId, setBatchCallId] = useState<string | null>(null);
+  const [batchCallResult, setBatchCallResult] = useState<string | null>(null);
+
+  const handleGetCapabilities = useCallback(async () => {
+    if (!walletClient || !address) {
+      setError('No wallet client or address');
+      return;
+    }
+    
+    setIsGettingCapabilities(true);
+    setError(null);
+    
+    try {
+      const capabilities = await walletClient.getCapabilities({
+        account: address,
+      });
+      if (!capabilities) {
+        setError('No capabilities found');
+      } else {
+        setCapabilities(JSON.stringify(capabilities, null, 2));
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Unknown error');
+    } finally {
+      setIsGettingCapabilities(false);
+    }
+  }, [walletClient, address]);
+
+  const handleSendCalls = useCallback(async () => {
+    if (!walletClient || !address) {
+      setError('No wallet client or address');
+      return;
+    }
+    switchChain({ chainId: base.id });
+    
+    setIsSendingCalls(true);
+    setError(null);
+    setBatchCallId(null);
+    setBatchCallResult(null);
+    
+    try {
+      const { id } = await walletClient.sendCalls({ 
+        account: address,
+        forceAtomic,
+        chain: base,
+        calls: [
+          {
+            to: '0x729170d38dd5449604f35f349fdfcc9ad08257cd',
+            value: parseEther('0.00002')
+          },
+          {
+            to: '0xf4319842934025823b461db1fa545d144833e84e',
+            value: parseEther('0.00002')
+          },
+          {
+            to: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+            value: parseEther('0'),
+            data: '0xa9059cbb000000000000000000000000729170d38dd5449604f35f349fdfcc9ad08257cd0000000000000000000000000000000000000000000000000000000000002710'
+          },
+        ],
+      });
+      setBatchCallId(id);
+      
+      const result = await walletClient.waitForCallsStatus({
+        id,
+        pollingInterval: 200,
+      });
+      console.log('result', result);
+      setBatchCallResult(safeJsonStringify(result));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Unknown error');
+    } finally {
+      setIsSendingCalls(false);
+    }
+  }, [walletClient, address, forceAtomic, switchChain]);
+
+  return (
+    <>
+      <div className="mb-4">
+        <div className="p-2 bg-gray-100 dark:bg-gray-800 rounded-lg my-2">
+          <pre className="font-mono text-xs whitespace-pre-wrap break-words max-w-[260px] overflow-x-">
+            wallet.getCapabilities / wallet.sendCalls
+          </pre>
+        </div>
+        
+        <div className="mb-4">
+          <Button 
+            onClick={handleGetCapabilities}
+            disabled={!isConnected || isGettingCapabilities}
+            isLoading={isGettingCapabilities}
+          >
+            Get Capabilities
+          </Button>
+          
+          {capabilities && (
+            <div className="mt-2 p-2 bg-gray-100 dark:bg-gray-800 rounded-lg">
+              <div className="font-semibold text-gray-500 dark:text-gray-300 mb-1">Capabilities</div>
+              <pre className="font-mono text-xs whitespace-pre-wrap break-words max-w-[260px] overflow-x-">
+                {capabilities}
+              </pre>
+            </div>
+          )}
+        </div>
+
+        <div className="mb-4">
+          <div className="flex items-center gap-2 mb-2">
+            <input
+              type="checkbox"
+              id="force-atomic"
+              checked={forceAtomic}
+              onChange={(e) => setForceAtomic(e.target.checked)}
+              className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
+            />
+            <label htmlFor="force-atomic" className="text-sm font-medium text-gray-700 dark:text-gray-300">
+              Force Atomic
+            </label>
+          </div>
+          
+          <Button 
+            onClick={handleSendCalls}
+            disabled={!isConnected || isSendingCalls}
+            isLoading={isSendingCalls}
+          >
+            Send Batch Calls
+          </Button>
+        </div>
+
+        {batchCallId && (
+          <div className="mb-2 text-xs">
+            Batch Call ID: {batchCallId}
+          </div>
+        )}
+
+        {batchCallResult && (
+          <div className="mt-2 p-2 bg-gray-100 dark:bg-gray-800 rounded-lg">
+            <div className="font-semibold text-gray-500 dark:text-gray-300 mb-1">Batch Call Result</div>
+            <pre className="font-mono text-xs whitespace-pre-wrap break-words max-w-[260px] overflow-x-">
+              {batchCallResult}
+            </pre>
+          </div>
+        )}
+
+        {error && (
+          <div className="text-red-500 text-xs mt-1">{error}</div>
+        )}
+      </div>
+    </>
+  );
+}
+
 function SendSolana() {
   const [state, setState] = useState<
     | { status: 'none' }
@@ -1286,6 +1470,84 @@ function ViewProfile() {
       >
         View Profile
       </Button>
+    </>
+  );
+}
+
+function OpenMiniApp() {
+  const [selectedUrl, setSelectedUrl] = useState("");
+  const [openResult, setOpenResult] = useState<string>("");
+  const [isOpening, setIsOpening] = useState(false);
+
+  const urlOptions = [
+    { label: "Select a URL", value: "", disabled: true },
+    { 
+      label: "Bountycaster (Embed)", 
+      value: "https://www.bountycaster.xyz/bounty/0x392626b092e05955c11c41c5df8e2fb8003ece78" 
+    },
+    { 
+      label: "Eggs (Launcher)", 
+      value: "https://farcaster.xyz/miniapps/Qqjy9efZ-1Qu/eggs" 
+    },
+    { 
+      label: "Invalid URL", 
+      value: "https://swizec.com/" 
+    },
+  ];
+
+  const handleOpenMiniApp = useCallback(async () => {
+    if (!selectedUrl) {
+      setOpenResult("Please select a URL");
+      return;
+    }
+
+    setIsOpening(true);
+    setOpenResult("");
+
+    try {
+      await sdk.actions.openMiniApp({url: selectedUrl});
+      setOpenResult("Mini app opened successfully");
+    } catch (error) {
+      setOpenResult(`Error: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setIsOpening(false);
+    }
+  }, [selectedUrl]);
+
+  return (
+    <>
+      <div>
+        <Label
+          className="text-xs font-semibold text-gray-500 dark:text-gray-300 mb-1"
+          htmlFor="mini-app-select"
+        >
+          Select Mini App URL
+        </Label>
+        <select
+          id="mini-app-select"
+          value={selectedUrl}
+          onChange={(e) => setSelectedUrl(e.target.value)}
+          className="w-full mb-2 p-2 bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 border border-gray-300 dark:border-gray-700 rounded"
+        >
+          {urlOptions.map(option => (
+            <option key={option.value} value={option.value} disabled={option.disabled}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </div>
+      <Button
+        onClick={handleOpenMiniApp}
+        disabled={!selectedUrl || isOpening}
+        isLoading={isOpening}
+      >
+        Open Mini App
+      </Button>
+      {openResult && (
+        <div className="mt-2 text-xs text-gray-600 dark:text-gray-400">
+          {openResult}
+        </div>
+      )}
     </>
   );
 }
