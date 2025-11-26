@@ -18,7 +18,7 @@ import {
   VersionedTransaction,
   TransactionMessage,
 } from "@solana/web3.js";
-import { useEffect, useCallback, useState, useMemo } from "react";
+import { useEffect, useCallback, useState, useMemo, type ChangeEvent } from "react";
 import { Input } from "../components/ui/input";
 import sdk, {
   AddMiniApp,
@@ -44,7 +44,7 @@ import { config } from "~/components/providers/WagmiProvider";
 import { Button } from "~/components/ui/Button";
 import { truncateAddress } from "~/lib/truncateAddress";
 import { base, degen, mainnet, monadTestnet, optimism, unichain } from "wagmi/chains";
-import { BaseError, parseEther, UserRejectedRequestError } from "viem";
+import { BaseError, parseEther, UserRejectedRequestError, encodeFunctionData, parseAbi } from "viem";
 import { createStore } from "mipd";
 import { Label } from "~/components/ui/label";
 
@@ -175,6 +175,9 @@ export default function Demo(
       ethereumProvider?.on("chainChanged", (chainId) => {
         console.log("[ethereumProvider] chainChanged", chainId)
       })
+      ethereumProvider?.on("connect", (connectInfo) => {
+        console.log("[ethereumProvider] connect", connectInfo);
+      });
 
       sdk.actions.ready({});
 
@@ -357,6 +360,15 @@ export default function Demo(
               </pre>
             </div>
             <QuickAuth setToken={setToken} token={token} />
+          </div>
+
+          <div className="mb-4">
+            <div className="p-2 bg-gray-100 dark:bg-gray-800 rounded-lg my-2">
+              <pre className="font-mono text-xs whitespace-pre-wrap break-words max-w-[260px] overflow-x-">
+                sdk.experimental.signManifest
+              </pre>
+            </div>
+            <SignManifest />
           </div>
 
           <div className="mb-4">
@@ -572,27 +584,79 @@ export default function Demo(
 }
 
 function ComposeCastAction() {
+  const channelOptions = useMemo(
+    () => [
+      { value: "", label: "No channel" },
+      { value: "staging", label: "staging" },
+      { value: "founders", label: "founders" },
+      { value: "bounties", label: "bounties" },
+      { value: "gaming", label: "gaming" },
+    ],
+    [],
+  );
+
   const [result, setResult] = useState<ComposeCast.Result>();
-  const compose = useCallback(async () => {
-    setResult(await sdk.actions.composeCast({
-      text: 'Hello from Demo Mini App',
-      embeds: ["https://test.com/foo%20bar"],
-    }))
+  const [error, setError] = useState<string | null>(null);
+  const [channelKey, setChannelKey] = useState<string | undefined>(undefined);
+
+  const handleChannelChange = useCallback((event: ChangeEvent<HTMLSelectElement>) => {
+    const { value } = event.target;
+    setChannelKey(value ? value : undefined);
   }, []);
 
+  const compose = useCallback(async () => {
+    setError(null);
+    setResult(undefined);
+    try {
+      const result = await sdk.actions.composeCast({
+        text: "Hello from Demo Mini App",
+        embeds: ["https://test.com/foo%20bar"],
+        channelKey,
+      });
+      setResult(result);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : 'Unknown error occurred while composing cast');
+    }
+  }, [channelKey]);
+
   return (
-    <>
+    <div className="flex flex-col gap-2">
+      <div>
+        <Label
+          className="text-xs font-semibold text-gray-500 dark:text-gray-300 mb-1"
+          htmlFor="compose-channel-select"
+        >
+          Select channel
+        </Label>
+        <select
+          id="compose-channel-select"
+          value={channelKey ?? ""}
+          onChange={handleChannelChange}
+          className="w-full p-2 bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 border border-gray-300 dark:border-gray-700 rounded"
+        >
+          {channelOptions.map((option) => (
+            <option key={option.value || "none"} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </div>
       <Button
         onClick={compose}
       >
         Compose Cast
       </Button>
+      {error && (
+        <div className="mt-2 text-xs text-red-500 dark:text-red-400">
+          {error}
+        </div>
+      )}
       {result && (
         <div className="mt-2 text-xs">
           <div>Cast Hash: {result.cast?.hash}</div>
         </div>
       )}
-    </>
+    </div>
   );
 }
 
@@ -1142,6 +1206,12 @@ function TestBatchOperation() {
   const [batchCallId, setBatchCallId] = useState<string | null>(null);
   const [batchCallResult, setBatchCallResult] = useState<string | null>(null);
 
+  // State for explicit USDC approve + MockTransfer.mockTransfer test (non-atomic)
+  const [isSendingApproveTransfer, setIsSendingApproveTransfer] = useState(false);
+  const [approveTransferId, setApproveTransferId] = useState<string | null>(null);
+  const [approveTransferResult, setApproveTransferResult] = useState<string | null>(null);
+  const [approveTransferError, setApproveTransferError] = useState<string | null>(null);
+
   const handleGetCapabilities = useCallback(async () => {
     if (!walletClient || !address) {
       setError('No wallet client or address');
@@ -1215,6 +1285,61 @@ function TestBatchOperation() {
     }
   }, [walletClient, address, forceAtomic, switchChain]);
 
+  const handleSendCallsApproveAndTransfer = useCallback(async () => {
+    if (!walletClient || !address) {
+      setApproveTransferError('No wallet client or address');
+      return;
+    }
+    // Ensure we are on Base for this test
+    switchChain({ chainId: base.id });
+
+    setIsSendingApproveTransfer(true);
+    setApproveTransferError(null);
+    setApproveTransferId(null);
+    setApproveTransferResult(null);
+
+    try {
+      const BASE_USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+      const MOCK_TRANSFER = '0xDC5A772d22558524cbBbfa8Ba6E83b5BebE45783';
+      const TEN_CENTS_USDC = 100_000n; // 0.10 USDC with 6 decimals
+
+      const approveData = encodeFunctionData({
+        abi: parseAbi(['function approve(address spender, uint256 value) returns (bool)']),
+        functionName: 'approve',
+        args: [MOCK_TRANSFER, TEN_CENTS_USDC],
+      });
+
+      const mockTransferData = encodeFunctionData({
+        abi: parseAbi(['function mockTransfer(uint256 amount)']),
+        functionName: 'mockTransfer',
+        args: [TEN_CENTS_USDC],
+      });
+
+      const { id } = await walletClient.sendCalls({
+        account: address,
+        chain: base,
+        // Explicitly non-atomic per request
+        forceAtomic: false,
+        calls: [
+          { to: BASE_USDC, value: 0n, data: approveData },
+          { to: MOCK_TRANSFER, value: 0n, data: mockTransferData },
+        ],
+      });
+
+      setApproveTransferId(id);
+
+      const result = await walletClient.waitForCallsStatus({
+        id,
+        pollingInterval: 200,
+      });
+      setApproveTransferResult(safeJsonStringify(result));
+    } catch (e) {
+      setApproveTransferError(e instanceof Error ? e.message : 'Unknown error');
+    } finally {
+      setIsSendingApproveTransfer(false);
+    }
+  }, [walletClient, address, switchChain]);
+
   return (
     <>
       <div className="mb-4">
@@ -1266,6 +1391,16 @@ function TestBatchOperation() {
           </Button>
         </div>
 
+        <div className="mb-4">
+          <Button
+            onClick={handleSendCallsApproveAndTransfer}
+            disabled={!isConnected || isSendingApproveTransfer}
+            isLoading={isSendingApproveTransfer}
+          >
+            SendCalls: Approve 10c USDC + mockTransfer (This will take 10c in USDC, use at your own discression)
+          </Button>
+        </div>
+
         {batchCallId && (
           <div className="mb-2 text-xs">
             Batch Call ID: {batchCallId}
@@ -1283,6 +1418,25 @@ function TestBatchOperation() {
 
         {error && (
           <div className="text-red-500 text-xs mt-1">{error}</div>
+        )}
+
+        {approveTransferId && (
+          <div className="mb-2 text-xs">
+            Approve + Transfer ID: {approveTransferId}
+          </div>
+        )}
+
+        {approveTransferResult && (
+          <div className="mt-2 p-2 bg-gray-100 dark:bg-gray-800 rounded-lg">
+            <div className="font-semibold text-gray-500 dark:text-gray-300 mb-1">Approve + Transfer Result</div>
+            <pre className="font-mono text-xs whitespace-pre-wrap break-words max-w-[260px] overflow-x-">
+              {approveTransferResult}
+            </pre>
+          </div>
+        )}
+
+        {approveTransferError && (
+          <div className="text-red-500 text-xs mt-1">{approveTransferError}</div>
         )}
       </div>
     </>
@@ -1437,6 +1591,73 @@ function QuickAuth({ setToken, token }: { setToken: (token: string | null) => vo
       )}
     </>
   );
+}
+
+function SignManifest() {
+  const [domain, setDomain] = useState('www.microsoft.com')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [result, setResult] = useState<unknown>(null)
+
+  const handleSignManifest = async () => {
+    setLoading(true)
+    setError(null)
+    setResult(null)
+
+    try {
+      const manifest = await sdk.experimental.signManifest({ domain })
+      setResult(manifest)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'An error occurred')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <Label
+          className="text-xs font-semibold text-gray-500 dark:text-gray-300 mb-1"
+          htmlFor="domain-input"
+        >
+          Domain
+        </Label>
+        <Input
+          id="domain-input"
+          type="text"
+          value={domain}
+          onChange={(e) => setDomain(e.target.value)}
+          className="w-full mb-2"
+          placeholder="Enter domain (e.g., http://www.microsoft.com)"
+        />
+      </div>
+
+      <Button
+        onClick={handleSignManifest}
+        disabled={loading || !domain}
+        isLoading={loading}
+      >
+        {loading ? 'Signing...' : 'Sign Manifest'}
+      </Button>
+
+      {error && (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-md">
+          <p className="text-red-600 font-medium">Error:</p>
+          <p className="text-red-500">{error}</p>
+        </div>
+      )}
+
+      {result !== null && result !== undefined && (
+        <div className="p-4 bg-gray-50 border border-gray-200 rounded-md">
+          <p className="font-medium mb-2">Signed Manifest:</p>
+          <pre className="bg-white p-3 rounded border border-gray-300 overflow-x-auto">
+            {safeJsonStringify(result)}
+          </pre>
+        </div>
+      )}
+    </div>
+  )
 }
 
 function ViewProfile() {
